@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="KVStore.vcxproj" />
+  <Project Path="KVStore.vcxproj" Id="8e0f0b1e-89b8-48f3-9b5b-18f05ebd0d5d" />
 </Solution>

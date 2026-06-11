@@ -2,25 +2,48 @@
 #include <string>
 #include <unordered_map>
 #include <sstream>
-#include <thread>
-#include <winsock2.h>
-#pragma comment(lib, "ws2_32.lib")
+#include <fstream>
 
 using namespace std;
 
 class KVStore {
 private:
     unordered_map<string, string> data;
+    string filename = "kvs_data.txt";
 
 public:
+    // 加载数据（程序启动时自动调用）
+    void load() {
+        ifstream file(filename);
+        if (!file.is_open()) return;
+        string key, value;
+        while (file >> key) {
+            file.ignore();  // 跳过空格
+            getline(file, value);
+            data[key] = value;
+        }
+        file.close();
+        cout << "Loaded " << data.size() << " records from disk." << endl;
+    }
+
+    // 保存数据（每次修改后自动调用）
+    void save() {
+        ofstream file(filename);
+        for (const auto& pair : data) {
+            file << pair.first << " " << pair.second << endl;
+        }
+        file.close();
+    }
+
     string set(const string& key, const string& value) {
         data[key] = value;
+        save();  // 改完就存盘
         return "OK";
     }
 
     string get(const string& key) {
         auto it = data.find(key);
-        if (it != data.end()) return data[key];
+        if (it != data.end()) return it->second;
         return "(null)";
     }
 
@@ -28,6 +51,7 @@ public:
         auto it = data.find(key);
         if (it != data.end()) {
             data.erase(key);
+            save();  // 删完就存盘
             return "OK";
         }
         return "(null)";
@@ -77,26 +101,12 @@ public:
 };
 
 int main() {
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-
-    sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8888);
-
-    bind(server_fd, (sockaddr*)&address, sizeof(address));
-    listen(server_fd, 10);
-
-    cout << "=== KV Store Server ===" << endl;
-    cout << "Server running on port 8888" << endl;
-    cout << "Type commands below or connect via telnet." << endl;
-    cout << "Commands: set <key> <value> | get <key> | del <key> | keys | exit" << endl;
-
     KVStore kvs;
+    kvs.load();  // 启动时自动加载之前存的数据
+
     string line;
+    cout << "=== KV Store with Persistence ===" << endl;
+    cout << "Commands: set <key> <value> | get <key> | del <key> | keys | exit" << endl;
 
     while (true) {
         cout << "> ";
@@ -105,8 +115,6 @@ int main() {
         cout << kvs.execute(line) << endl;
     }
 
-    closesocket(server_fd);
-    WSACleanup();
     cout << "bye!" << endl;
     return 0;
 }
