@@ -5,6 +5,7 @@
 #include <fstream>
 #include <list>
 #include <thread>
+#include <mutex>
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
 
@@ -15,11 +16,13 @@ private:
     int capacity;
     list<pair<string, string>> items;
     unordered_map<string, list<pair<string, string>>::iterator> cache;
+    mutex lru_mutex;  // 线程安全
 
 public:
     LRUCache(int cap = 10) : capacity(cap) {}
 
     void put(const string& key, const string& value) {
+        lock_guard<mutex> lock(lru_mutex);
         auto it = cache.find(key);
         if (it != cache.end()) {
             items.erase(it->second);
@@ -33,6 +36,7 @@ public:
     }
 
     string get(const string& key) {
+        lock_guard<mutex> lock(lru_mutex);
         auto it = cache.find(key);
         if (it == cache.end()) return "(null)";
         items.splice(items.begin(), items, it->second);
@@ -40,6 +44,7 @@ public:
     }
 
     void remove(const string& key) {
+        lock_guard<mutex> lock(lru_mutex);
         auto it = cache.find(key);
         if (it != cache.end()) {
             items.erase(it->second);
@@ -53,9 +58,11 @@ private:
     unordered_map<string, string> data;
     LRUCache lru;
     string filename = "kvs_data.txt";
+    mutex data_mutex;  // 数据锁
 
 public:
     void load() {
+        lock_guard<mutex> lock(data_mutex);
         ifstream file(filename);
         if (!file.is_open()) return;
         string key, value;
@@ -65,10 +72,10 @@ public:
             data[key] = value;
         }
         file.close();
-        cout << "Loaded " << data.size() << " records." << endl;
     }
 
     void save() {
+        lock_guard<mutex> lock(data_mutex);
         ofstream file(filename);
         for (const auto& pair : data) {
             file << pair.first << " " << pair.second << endl;
@@ -77,7 +84,10 @@ public:
     }
 
     string set(const string& key, const string& value) {
-        data[key] = value;
+        {
+            lock_guard<mutex> lock(data_mutex);
+            data[key] = value;
+        }
         lru.put(key, value);
         save();
         return "OK";
@@ -86,21 +96,27 @@ public:
     string get(const string& key) {
         string val = lru.get(key);
         if (val != "(null)") return val;
-        auto it = data.find(key);
-        if (it != data.end()) {
-            lru.put(key, it->second);
-            return it->second;
+        {
+            lock_guard<mutex> lock(data_mutex);
+            auto it = data.find(key);
+            if (it != data.end()) {
+                lru.put(key, it->second);
+                return it->second;
+            }
         }
         return "(null)";
     }
 
     string del(const string& key) {
-        auto it = data.find(key);
-        if (it != data.end()) {
-            data.erase(key);
-            lru.remove(key);
-            save();
-            return "OK";
+        {
+            lock_guard<mutex> lock(data_mutex);
+            auto it = data.find(key);
+            if (it != data.end()) {
+                data.erase(key);
+                lru.remove(key);
+                save();
+                return "OK";
+            }
         }
         return "(null)";
     }
@@ -130,6 +146,7 @@ public:
             return del(key);
         }
         else if (cmd == "keys") {
+            lock_guard<mutex> lock(data_mutex);
             string result;
             for (const auto& pair : data)
                 result += pair.first + " ";
@@ -141,7 +158,6 @@ public:
     }
 };
 
-// 处理单个客户端连接
 void handle_client(int client_fd, KVStore* kvs) {
     char buffer[4096];
     string leftover;
@@ -191,12 +207,13 @@ void start_server(KVStore* kvs) {
     bind(server_fd, (sockaddr*)&address, sizeof(address));
     listen(server_fd, 10);
 
-    cout << "Network server started on port 8888" << endl;
+    cout << "Network server started on port 8888 (multi-threaded)" << endl;
 
     while (true) {
         sockaddr_in client_addr;
         int addr_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (sockaddr*)&client_addr, &addr_len);
+        cout << "New client connected!" << endl;
         thread(handle_client, client_fd, kvs).detach();
     }
 
@@ -208,14 +225,13 @@ int main() {
     KVStore kvs;
     kvs.load();
 
-    // 启动网络服务器（后台线程）
     thread server_thread(start_server, &kvs);
     server_thread.detach();
 
     cout << "=== KV Store Server ===" << endl;
     cout << "Network: telnet 127.0.0.1 8888" << endl;
-    cout << "Type commands below or connect via network." << endl;
-    cout << "Commands: set <key> <value> | get <key> | del <key> | keys | exit" << endl;
+    cout << "Multi-threaded: multiple clients supported!" << endl;
+    cout << "Local commands: set <key> <value> | get <key> | del <key> | keys | exit" << endl;
 
     while (true) {
         cout << "> ";
