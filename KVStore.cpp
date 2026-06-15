@@ -6,20 +6,45 @@
 #include <list>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace std;
+using namespace chrono;
 
+// ========== 配置 ==========
+struct Config {
+    int port = 8888;
+    int cache_capacity = 10;
+    string data_file = "kvs_data.txt";
+};
+
+Config load_config(const string& filename = "config.txt") {
+    Config cfg;
+    ifstream file(filename);
+    if (!file.is_open()) return cfg;
+    string key, value;
+    while (file >> key >> value) {
+        if (key == "port") cfg.port = stoi(value);
+        else if (key == "cache_capacity") cfg.cache_capacity = stoi(value);
+        else if (key == "data_file") cfg.data_file = value;
+    }
+    file.close();
+    return cfg;
+}
+
+// ========== LRU 缓存 ==========
 class LRUCache {
 private:
     int capacity;
     list<pair<string, string>> items;
     unordered_map<string, list<pair<string, string>>::iterator> cache;
-    mutex lru_mutex;  // 线程安全
+    mutex lru_mutex;
+    int hits = 0, misses = 0;
 
 public:
-    LRUCache(int cap = 10) : capacity(cap) {}
+    LRUCache(int cap) : capacity(cap) {}
 
     void put(const string& key, const string& value) {
         lock_guard<mutex> lock(lru_mutex);
@@ -38,7 +63,11 @@ public:
     string get(const string& key) {
         lock_guard<mutex> lock(lru_mutex);
         auto it = cache.find(key);
-        if (it == cache.end()) return "(null)";
+        if (it == cache.end()) {
+            misses++;
+            return "(null)";
+        }
+        hits++;
         items.splice(items.begin(), items, it->second);
         return it->second->second;
     }
@@ -51,19 +80,26 @@ public:
             cache.erase(key);
         }
     }
+
+    int get_hits() { lock_guard<mutex> lock(lru_mutex); return hits; }
+    int get_misses() { lock_guard<mutex> lock(lru_mutex); return misses; }
 };
 
+// ========== KV 存储 ==========
 class KVStore {
 private:
     unordered_map<string, string> data;
     LRUCache lru;
-    string filename = "kvs_data.txt";
-    mutex data_mutex;  // 数据锁
+    Config config;
+    mutex data_mutex;
+    int cmd_count = 0;
 
 public:
+    KVStore(const Config& cfg) : lru(cfg.cache_capacity), config(cfg) {}
+
     void load() {
         lock_guard<mutex> lock(data_mutex);
-        ifstream file(filename);
+        ifstream file(config.data_file);
         if (!file.is_open()) return;
         string key, value;
         while (file >> key) {
@@ -72,14 +108,14 @@ public:
             data[key] = value;
         }
         file.close();
+        cout << "Loaded " << data.size() << " records from " << config.data_file << endl;
     }
 
     void save() {
         lock_guard<mutex> lock(data_mutex);
-        ofstream file(filename);
-        for (const auto& pair : data) {
+        ofstream file(config.data_file);
+        for (const auto& pair : data)
             file << pair.first << " " << pair.second << endl;
-        }
         file.close();
     }
 
@@ -90,20 +126,23 @@ public:
         }
         lru.put(key, value);
         save();
+        cmd_count++;
         return "OK";
     }
 
     string get(const string& key) {
         string val = lru.get(key);
-        if (val != "(null)") return val;
+        if (val != "(null)") { cmd_count++; return val; }
         {
             lock_guard<mutex> lock(data_mutex);
             auto it = data.find(key);
             if (it != data.end()) {
                 lru.put(key, it->second);
+                cmd_count++;
                 return it->second;
             }
         }
+        cmd_count++;
         return "(null)";
     }
 
@@ -115,10 +154,29 @@ public:
                 data.erase(key);
                 lru.remove(key);
                 save();
+                cmd_count++;
                 return "OK";
             }
         }
+        cmd_count++;
         return "(null)";
+    }
+
+    string stats() {
+        int total = lru.get_hits() + lru.get_misses();
+        double rate = total > 0 ? (double)lru.get_hits() / total * 100 : 0;
+        lock_guard<mutex> lock(data_mutex);
+        stringstream ss;
+        ss << "--- Server Stats ---" << endl;
+        ss << "Total keys:  " << data.size() << endl;
+        ss << "Commands:    " << cmd_count << endl;
+        ss << "Cache hits:  " << lru.get_hits() << endl;
+        ss << "Cache miss:  " << lru.get_misses() << endl;
+        ss << "Hit rate:    " << (int)rate << "%" << endl;
+        ss << "Data file:   " << config.data_file << endl;
+        ss << "Port:        " << config.port << endl;
+        ss << "Cache cap:   " << config.cache_capacity << endl;
+        return ss.str();
     }
 
     string execute(const string& cmd_line) {
@@ -152,12 +210,16 @@ public:
                 result += pair.first + " ";
             return result.empty() ? "(empty)" : result;
         }
+        else if (cmd == "stats") {
+            return stats();
+        }
         else {
             return "Unknown command";
         }
     }
 };
 
+// ========== 客户端处理 ==========
 void handle_client(int client_fd, KVStore* kvs) {
     char buffer[4096];
     string leftover;
@@ -179,41 +241,35 @@ void handle_client(int client_fd, KVStore* kvs) {
             while (!cmd.empty() && cmd[0] == ' ') cmd.erase(0, 1);
 
             if (cmd.empty()) continue;
-            if (cmd == "exit") {
-                closesocket(client_fd);
-                return;
-            }
+            if (cmd == "exit") { closesocket(client_fd); return; }
 
             string result = kvs->execute(cmd);
             result += "\n";
             send(client_fd, result.c_str(), result.length(), 0);
         }
     }
-
     closesocket(client_fd);
 }
 
-void start_server(KVStore* kvs) {
+void start_server(KVStore* kvs, int port) {
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-
     sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8888);
+    address.sin_port = htons(port);
 
     bind(server_fd, (sockaddr*)&address, sizeof(address));
     listen(server_fd, 10);
 
-    cout << "Network server started on port 8888 (multi-threaded)" << endl;
+    cout << "Network server started on port " << port << " (multi-threaded)" << endl;
 
     while (true) {
         sockaddr_in client_addr;
         int addr_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (sockaddr*)&client_addr, &addr_len);
-        cout << "New client connected!" << endl;
         thread(handle_client, client_fd, kvs).detach();
     }
 
@@ -221,17 +277,18 @@ void start_server(KVStore* kvs) {
     WSACleanup();
 }
 
+// ========== 主函数 ==========
 int main() {
-    KVStore kvs;
+    Config config = load_config();
+
+    KVStore kvs(config);
     kvs.load();
 
-    thread server_thread(start_server, &kvs);
+    thread server_thread(start_server, &kvs, config.port);
     server_thread.detach();
 
     cout << "=== KV Store Server ===" << endl;
-    cout << "Network: telnet 127.0.0.1 8888" << endl;
-    cout << "Multi-threaded: multiple clients supported!" << endl;
-    cout << "Local commands: set <key> <value> | get <key> | del <key> | keys | exit" << endl;
+    cout << "Commands: set | get | del | keys | stats | exit" << endl;
 
     while (true) {
         cout << "> ";

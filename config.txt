@@ -1,0 +1,3 @@
+port 8888
+cache_capacity 10
+data_file kvs_data.txt
